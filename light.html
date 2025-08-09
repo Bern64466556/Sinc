@@ -1,0 +1,360 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Spotify Light Sync - Bern</title>
+<style>
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    background: #000;
+    overflow: hidden;
+  }
+  #fullscreen {
+    width: 100vw;
+    height: 100vh;
+    background-color: black;
+    transition: background-color 0.15s linear;
+  }
+  #start {
+    position: fixed;
+    top: 50%; left: 50%;
+    transform: translate(-50%, -50%);
+    padding: 14px 24px;
+    font-size: 20px;
+    background: #111;
+    color: white;
+    border: none;
+    border-radius: 10px;
+    cursor: pointer;
+    z-index: 10;
+  }
+  #status {
+    position: fixed;
+    top: 12px; left: 12px;
+    color: #fff;
+    font-family: system-ui, sans-serif;
+    background: rgba(0,0,0,0.4);
+    padding: 6px 12px;
+    border-radius: 8px;
+    user-select: none;
+    z-index: 10;
+  }
+</style>
+</head>
+<body>
+<div id="fullscreen"></div>
+<button id="start">Iniciar Spotify Light Sync</button>
+<div id="status">Status: parado</div>
+
+<script>
+const CLIENT_ID = 'COLOQUE_SEU_CLIENT_ID_AQUI';
+const REDIRECT_URI = 'https://SEU_USUARIO.github.io/spotify-light-sync/callback';
+const SCOPES = [
+  'streaming',
+  'user-read-playback-state',
+  'user-read-currently-playing',
+  'user-modify-playback-state'
+].join(' ');
+
+const startBtn = document.getElementById('start');
+const statusEl = document.getElementById('status');
+const fullscreen = document.getElementById('fullscreen');
+
+// PKCE helpers
+function randStr(len=64){
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~';
+  let s=''; for(let i=0;i<len;i++) s+=chars.charAt(Math.floor(Math.random()*chars.length));
+  return s;
+}
+async function sha256Base64url(str){
+  const encoder = new TextEncoder();
+  const data = encoder.encode(str);
+  const hash = await crypto.subtle.digest('SHA-256', data);
+  const b64 = btoa(String.fromCharCode(...new Uint8Array(hash)));
+  return b64.replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+}
+
+const PKCE_VERIFIER_KEY = 'sp_pkce_verifier';
+const TOKEN_INFO_KEY = 'sp_token_info';
+
+function log(t){
+  console.log(t);
+}
+
+async function startAuth(){
+  const verifier = randStr(64);
+  const challenge = await sha256Base64url(verifier);
+  sessionStorage.setItem(PKCE_VERIFIER_KEY, verifier);
+
+  const authUrl = new URL('https://accounts.spotify.com/authorize');
+  authUrl.searchParams.set('client_id', CLIENT_ID);
+  authUrl.searchParams.set('response_type', 'code');
+  authUrl.searchParams.set('redirect_uri', REDIRECT_URI);
+  authUrl.searchParams.set('code_challenge_method', 'S256');
+  authUrl.searchParams.set('code_challenge', challenge);
+  authUrl.searchParams.set('scope', SCOPES);
+  location.href = authUrl.toString();
+}
+
+async function handleRedirectCallback(){
+  const params = new URLSearchParams(location.search);
+  if (params.has('code')){
+    const code = params.get('code');
+    history.replaceState({}, '', REDIRECT_URI);
+    const verifier = sessionStorage.getItem(PKCE_VERIFIER_KEY);
+    if (!verifier){
+      alert('PKCE verifier missing');
+      return;
+    }
+    try {
+      const tokenResp = await fetch('https://accounts.spotify.com/api/token', {
+        method: 'POST',
+        headers: { 'Content-Type':'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          client_id: CLIENT_ID,
+          grant_type: 'authorization_code',
+          code: code,
+          redirect_uri: REDIRECT_URI,
+          code_verifier: verifier
+        })
+      });
+      if (!tokenResp.ok) {
+        const txt = await tokenResp.text();
+        throw new Error('Token exchange failed: '+tokenResp.status+' '+txt);
+      }
+      const tokenJson = await tokenResp.json();
+      tokenJson.received_at = Date.now();
+      localStorage.setItem(TOKEN_INFO_KEY, JSON.stringify(tokenJson));
+      initAfterAuth();
+    } catch (err){
+      alert('Erro na troca do token: ' + err.message);
+      console.error(err);
+    }
+  } else {
+    const tokenInfo = JSON.parse(localStorage.getItem(TOKEN_INFO_KEY) || 'null');
+    if (tokenInfo && tokenInfo.access_token) {
+      initAfterAuth();
+    }
+  }
+}
+
+function getTokenInfo(){ return JSON.parse(localStorage.getItem(TOKEN_INFO_KEY) || 'null'); }
+async function refreshTokenIfNeeded(){
+  const t = getTokenInfo();
+  if (!t) return false;
+  const expiresIn = t.expires_in || 3600;
+  const expireAt = (t.received_at || 0) + (expiresIn*1000) - 60000;
+  if (Date.now() < expireAt) return true;
+  if (!t.refresh_token) return false;
+
+  try {
+    const resp = await fetch('https://accounts.spotify.com/api/token', {
+      method:'POST',
+      headers:{ 'Content-Type':'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        grant_type:'refresh_token',
+        refresh_token: t.refresh_token,
+        client_id: CLIENT_ID
+      })
+    });
+    if (!resp.ok) throw new Error('refresh failed');
+    const nj = await resp.json();
+    nj.refresh_token = nj.refresh_token || t.refresh_token;
+    nj.received_at = Date.now();
+    localStorage.setItem(TOKEN_INFO_KEY, JSON.stringify(nj));
+    return true;
+  } catch (err){
+    console.warn('refresh failed', err);
+    return false;
+  }
+}
+function getAccessToken(){ const t=getTokenInfo(); return t? t.access_token:null; }
+
+// Spotify Web Playback SDK loader
+function loadSpotifySDK(){
+  return new Promise((res, rej) => {
+    if(window.Spotify) return res();
+    const tag = document.createElement('script');
+    tag.src = 'https://sdk.scdn.co/spotify-player.js';
+    tag.onload = () => {
+      window.onSpotifyWebPlaybackSDKReady = () => res();
+    };
+    tag.onerror = (e) => rej(e);
+    document.head.appendChild(tag);
+  });
+}
+
+let player = null;
+let deviceId = null;
+
+async function initAfterAuth(){
+  statusEl.textContent = 'Autenticado, iniciando player...';
+  await refreshTokenIfNeeded();
+  const token = getAccessToken();
+  if(!token){
+    alert('Token não disponível');
+    return;
+  }
+  await loadSpotifySDK();
+
+  player = new Spotify.Player({
+    name: 'Bern Light Sync Player',
+    getOAuthToken: cb => { cb(token); },
+    volume: 0.5
+  });
+
+  player.addListener('ready', ({ device_id }) => {
+    deviceId = device_id;
+    statusEl.textContent = 'Player pronto! Transfira a reprodução para este dispositivo no app Spotify.';
+    startPollingPlayback();
+  });
+
+  player.addListener('initialization_error', ({message}) => log('Init error: ' + message));
+  player.addListener('authentication_error', ({message}) => log('Auth error: ' + message));
+  player.addListener('account_error', ({message}) => log('Account error: ' + message));
+  player.addListener('playback_error', ({message}) => log('Playback error: ' + message));
+
+  await player.connect();
+}
+
+let polling = false;
+let beats = [];
+let currentBeatIndex = 0;
+let trackId = null;
+let features = null;
+let analysis = null;
+
+async function startPollingPlayback(){
+  polling = true;
+  while(polling){
+    try {
+      await refreshTokenIfNeeded();
+      const resp = await fetch('https://api.spotify.com/v1/me/player/currently-playing', {
+        headers: { Authorization: 'Bearer ' + getAccessToken() }
+      });
+      if(resp.status === 204){
+        statusEl.textContent = 'Nenhuma faixa tocando';
+        await sleep(1500);
+        continue;
+      }
+      if(!resp.ok){
+        log('Erro currently-playing: ' + resp.status);
+        await sleep(1500);
+        continue;
+      }
+      const json = await resp.json();
+      if(!json || !json.item){
+        await sleep(1000);
+        continue;
+      }
+      const id = json.item.id;
+      if(id !== trackId){
+        trackId = id;
+        features = await fetchAudioFeatures(trackId);
+        analysis = await fetchAudioAnalysis(trackId);
+        if(analysis && Array.isArray(analysis.beats)){
+          beats = analysis.beats.map(b => b.start);
+          currentBeatIndex = 0;
+        } else beats = [];
+      }
+      if(beats.length > 0){
+        const state = await player.getCurrentState();
+        if(state && state.position != null){
+          const posSec = state.position / 1000;
+          while(currentBeatIndex < beats.length && beats[currentBeatIndex] < posSec - 0.05) currentBeatIndex++;
+          if(currentBeatIndex < beats.length){
+            const timeToNext = beats[currentBeatIndex] - posSec;
+            if(Math.abs(timeToNext) < 0.06){
+              flashByFeatures();
+              currentBeatIndex++;
+            }
+          }
+        }
+      }
+      statusEl.textContent = `Tocando: ${json.item.name} — ${json.item.artists.map(a => a.name).join(', ')}`;
+    } catch (err){
+      console.error(err);
+      statusEl.textContent = 'Erro ao obter reprodução';
+      await sleep(1500);
+    }
+  }
+}
+
+async function fetchAudioFeatures(id){
+  const r = await fetch(`https://api.spotify.com/v1/audio-features/${id}`, {
+    headers: { Authorization: 'Bearer ' + getAccessToken() }
+  });
+  if(!r.ok) return null;
+  return r.json();
+}
+
+async function fetchAudioAnalysis(id){
+  const r = await fetch(`https://api.spotify.com/v1/audio-analysis/${id}`, {
+    headers: { Authorization: 'Bearer ' + getAccessToken() }
+  });
+  if(!r.ok) return null;
+  return r.json();
+}
+
+function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
+
+function colorFromFeatures(){
+  if(!features) return {r:120, g:120, b:120};
+  const energy = features.energy || 0.5;
+  const valence = features.valence || 0.5;
+  const hue = (1 - valence) * 220 + valence * 60;
+  const sat = Math.min(1, 0.4 + energy * 0.9);
+  const light = Math.min(1, 0.35 + energy * 0.65);
+  return hslToRgbCSS(hue, sat, light);
+}
+
+function hslToRgbCSS(h, s, l){
+  const c = (1 - Math.abs(2 * l - 1)) * s;
+  const hh = h / 60;
+  const x = c * (1 - Math.abs(hh % 2 - 1));
+  let r1=0, g1=0, b1=0;
+  if(hh >= 0 && hh < 1){ r1=c; g1=x; b1=0; }
+  else if(hh < 2){ r1=x; g1=c; b1=0; }
+  else if(hh < 3){ r1=0; g1=c; b1=x; }
+  else if(hh < 4){ r1=0; g1=x; b1=c; }
+  else if(hh < 5){ r1=x; g1=0; b1=c; }
+  else { r1=c; g1=0; b1=x; }
+  const m = l - c/2;
+  const r = Math.round((r1 + m) * 255);
+  const g = Math.round((g1 + m) * 255);
+  const b = Math.round((b1 + m) * 255);
+  return {r, g, b};
+}
+
+let lastFlash = 0;
+function flashByFeatures(){
+  const now = Date.now();
+  if(now - lastFlash < 80) return;
+  lastFlash = now;
+  const col = colorFromFeatures();
+  fullscreen.style.backgroundColor = `rgb(${col.r},${col.g},${col.b})`;
+  setTimeout(() => {
+    fullscreen.style.transition = 'background-color 160ms linear';
+    fullscreen.style.backgroundColor = `rgb(${Math.round(col.r*0.22)},${Math.round(col.g*0.22)},${Math.round(col.b*0.22)})`;
+    setTimeout(() => fullscreen.style.transition = '', 180);
+  }, 70);
+}
+
+startBtn.addEventListener('click', () => {
+  if(!CLIENT_ID || CLIENT_ID.includes('COLOQUE')){
+    alert('Coloque seu CLIENT_ID no código antes de usar');
+    return;
+  }
+  const params = new URLSearchParams(location.search);
+  if(!params.has('code')){
+    startAuth();
+  } else {
+    handleRedirectCallback();
+  }
+});
+
+handleRedirectCallback();
+</script>
+</body>
+</html>
